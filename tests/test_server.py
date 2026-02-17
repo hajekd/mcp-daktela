@@ -5,6 +5,31 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from mcp_daktela import server
+from mcp_daktela.server import _date_filters
+
+
+class TestDateFilters:
+    def test_bare_date_to_gets_end_of_day(self):
+        filters = _date_filters("time", None, "2026-02-17")
+        assert filters == [("time", "lte", "2026-02-17 23:59:59")]
+
+    def test_bare_date_from_unchanged(self):
+        filters = _date_filters("time", "2026-02-17", None)
+        assert filters == [("time", "gte", "2026-02-17")]
+
+    def test_datetime_to_unchanged(self):
+        filters = _date_filters("time", None, "2026-02-17 12:00:00")
+        assert filters == [("time", "lte", "2026-02-17 12:00:00")]
+
+    def test_iso8601_t_separator_normalized(self):
+        filters = _date_filters("time", "2026-02-17T00:00:00", "2026-02-17T23:59:59")
+        assert filters == [
+            ("time", "gte", "2026-02-17 00:00:00"),
+            ("time", "lte", "2026-02-17 23:59:59"),
+        ]
+
+    def test_both_none_returns_empty(self):
+        assert _date_filters("time", None, None) == []
 
 MOCK_CLIENT_PATH = "mcp_daktela.server._get_client"
 
@@ -92,7 +117,7 @@ class TestListTickets:
         call_kwargs = client.list.call_args[1]
         filters = call_kwargs["field_filters"]
         assert ("created", "gte", "2024-01-01") in filters
-        assert ("created", "lte", "2024-01-31") in filters
+        assert ("created", "lte", "2024-01-31 23:59:59") in filters
 
     async def test_empty_result(self):
         client = _make_mock_client()
@@ -466,7 +491,7 @@ class TestListCalls:
         filters = call_kwargs["field_filters"]
         assert ("id_queue", "eq", "10333") in filters
         assert ("call_time", "gte", "2026-02-08") in filters
-        assert ("call_time", "lte", "2026-02-15") in filters
+        assert ("call_time", "lte", "2026-02-15 23:59:59") in filters
 
     async def test_empty_result(self):
         client = _make_mock_client()

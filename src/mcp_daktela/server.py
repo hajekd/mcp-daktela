@@ -261,13 +261,23 @@ def _get_base_url() -> str:
 def _date_filters(
     field: str, date_from: str | None, date_to: str | None
 ) -> list[tuple[str, str, str]]:
-    """Build date range filter tuples."""
+    """Build date range filter tuples.
+
+    Daktela expects 'YYYY-MM-DD HH:MM:SS'. A bare date like '2026-02-17'
+    is treated as midnight (00:00:00), so date_to without a time component
+    would exclude everything that happened during that day. We append
+    ' 23:59:59' to date_to when no time is present.
+    """
     filters = []
     if date_from:
-        # Normalize ISO 8601 'T' separator — Daktela expects 'YYYY-MM-DD HH:MM:SS'
+        # Normalize ISO 8601 'T' separator
         filters.append((field, "gte", date_from.replace("T", " ")))
     if date_to:
-        filters.append((field, "lte", date_to.replace("T", " ")))
+        normalized = date_to.replace("T", " ")
+        # If only a date was given (no time component), include the full day
+        if len(normalized) == 10:
+            normalized = normalized + " 23:59:59"
+        filters.append((field, "lte", normalized))
     return filters
 
 
