@@ -1,0 +1,36 @@
+# Environment & secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Test & lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code local settings (contains project-specific config, not for sharing)
+.claude/
+CLAUDE.md
+
+# Logo source pack (large binary assets, not needed in repo)
+Daktela_logopack/
