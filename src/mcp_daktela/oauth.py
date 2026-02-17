@@ -48,8 +48,11 @@ class OAuthGateMiddleware:
     a valid Bearer token, the server MUST return 401 with a WWW-Authenticate header
     pointing to the protected resource metadata. This triggers the OAuth discovery flow.
 
+    Also validates Bearer tokens: if the JWT is expired or malformed, returns 401
+    at the HTTP level (before MCP session processing) so the client can refresh.
+
     Requests to non-/mcp paths (OAuth endpoints, well-known, etc.) pass through.
-    Requests with Authorization: Bearer or X-Daktela-* headers pass through.
+    Requests with X-Daktela-* headers pass through (header-based auth).
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -73,11 +76,27 @@ class OAuthGateMiddleware:
             key.startswith(b"x-daktela-") for key in headers
         )
 
-        if has_bearer or has_daktela:
+        if has_daktela:
+            await self.app(scope, receive, send)
+            return
+
+        if has_bearer:
+            # Validate the JWT before passing through — expired/invalid tokens
+            # must return 401 at HTTP level so the MCP client triggers refresh.
+            jwt_secret = os.environ.get("JWT_SECRET", "")
+            if jwt_secret:
+                try:
+                    jwt.decode(auth[7:], jwt_secret, algorithms=[_JWT_ALGORITHM])
+                except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+                    return await self._send_401(scope, receive, send)
             await self.app(scope, receive, send)
             return
 
         # No auth — return 401 with WWW-Authenticate
+        await self._send_401(scope, receive, send)
+
+    async def _send_401(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Return 401 with WWW-Authenticate pointing to resource metadata."""
         scheme = "https"
         host = ""
         for key, value in scope.get("headers", []):
@@ -407,7 +426,11 @@ def _issue_token_response(
         "daktela_password": password,
         "exp": int(time.time()) + _REFRESH_TOKEN_LIFETIME,
     })
-    expires_in = max(0, access_exp - int(time.time()))
+    # Report expires_in 5 minutes early so the MCP client proactively refreshes
+    # before the token actually dies. On a real 401, the MCP SDK does full re-auth
+    # (opens browser) rather than a silent refresh_token exchange, so we want the
+    # proactive path to always fire first.
+    expires_in = max(0, access_exp - int(time.time()) - 300)
     return JSONResponse({
         "access_token": access_token,
         "token_type": "Bearer",

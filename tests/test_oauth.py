@@ -349,6 +349,120 @@ class TestRefreshToken:
 # ---------------------------------------------------------------------------
 
 
+class TestOAuthGateMiddleware:
+    """Test that OAuthGateMiddleware validates Bearer JWTs at the HTTP level."""
+
+    def _make_scope(self, headers: dict[str, str]) -> dict:
+        raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+        return {
+            "type": "http",
+            "path": "/mcp",
+            "headers": raw,
+        }
+
+    async def test_expired_bearer_returns_401(self):
+        from mcp_daktela.oauth import OAuthGateMiddleware
+
+        expired_jwt = _sign_jwt({
+            "type": "access_token",
+            "daktela_url": "https://test.daktela.com",
+            "daktela_access_token": "old",
+            "exp": int(time.time()) - 10,
+        })
+
+        app = AsyncMock()
+        mw = OAuthGateMiddleware(app)
+        scope = self._make_scope({
+            "Authorization": f"Bearer {expired_jwt}",
+            "Host": "mcp.example.com",
+        })
+
+        sent = []
+
+        async def capture_send(message):
+            sent.append(message)
+
+        await mw(scope, AsyncMock(), capture_send)
+
+        # Should NOT have called the inner app
+        app.assert_not_called()
+        # Should have sent a 401 response
+        start = [m for m in sent if m.get("type") == "http.response.start"]
+        assert start[0]["status"] == 401
+        resp_headers = dict(start[0]["headers"])
+        assert b"www-authenticate" in resp_headers
+
+    async def test_valid_bearer_passes_through(self):
+        from mcp_daktela.oauth import OAuthGateMiddleware
+
+        valid_jwt = _sign_jwt({
+            "type": "access_token",
+            "daktela_url": "https://test.daktela.com",
+            "daktela_access_token": "tok",
+            "exp": int(time.time()) + 3600,
+        })
+
+        app = AsyncMock()
+        mw = OAuthGateMiddleware(app)
+        scope = self._make_scope({"Authorization": f"Bearer {valid_jwt}"})
+
+        await mw(scope, AsyncMock(), AsyncMock())
+        app.assert_called_once()
+
+    async def test_daktela_headers_pass_through_without_jwt_check(self):
+        from mcp_daktela.oauth import OAuthGateMiddleware
+
+        app = AsyncMock()
+        mw = OAuthGateMiddleware(app)
+        scope = self._make_scope({
+            "X-Daktela-Url": "https://test.daktela.com",
+            "X-Daktela-Access-Token": "tok",
+        })
+
+        await mw(scope, AsyncMock(), AsyncMock())
+        app.assert_called_once()
+
+    async def test_no_auth_returns_401(self):
+        from mcp_daktela.oauth import OAuthGateMiddleware
+
+        app = AsyncMock()
+        mw = OAuthGateMiddleware(app)
+        scope = self._make_scope({"Host": "mcp.example.com"})
+
+        sent = []
+
+        async def capture_send(message):
+            sent.append(message)
+
+        await mw(scope, AsyncMock(), capture_send)
+
+        app.assert_not_called()
+        start = [m for m in sent if m.get("type") == "http.response.start"]
+        assert start[0]["status"] == 401
+
+
+class TestExpiresInBuffer:
+    """Verify that expires_in is reported conservatively (5 min early)."""
+
+    async def test_expires_in_has_buffer(self):
+        verifier, challenge = _make_pkce_pair()
+        access_exp = int(time.time()) + 7200  # 2 hours from now
+        auth_code = _make_auth_code(challenge, daktela_access_exp=access_exp)
+
+        request = _mock_form_request({
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "code_verifier": verifier,
+            "redirect_uri": "http://localhost:12345/callback",
+        })
+        resp = await handle_token(request)
+        body = json.loads(resp.body)
+
+        # expires_in should be ~2h minus 5min buffer (6900), not the full 7200
+        assert body["expires_in"] <= 7200 - 300 + 5  # +5s tolerance for test runtime
+        assert body["expires_in"] >= 7200 - 300 - 5
+
+
 class TestBearerTokenMiddleware:
     async def test_bearer_token_sets_contextvar(self):
         from mcp_daktela.auth import DaktelaAuthMiddleware, _request_config
