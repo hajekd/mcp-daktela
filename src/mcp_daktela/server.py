@@ -3,8 +3,9 @@
 import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from starlette.middleware import Middleware as ASGIMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -14,11 +15,18 @@ from mcp_daktela.logging_middleware import ToolLoggingMiddleware
 from mcp_daktela.client import DaktelaClient
 from mcp_daktela.config import get_config
 from mcp_daktela.formatting import (
+    _clean_email_body,
     _extract_id,
+    _extract_name,
+    _extract_ticket_from_activities,
+    _ticket_url,
     format_account,
     format_account_list,
     format_activity,
     format_activity_list,
+    format_article,
+    format_article_folder_tree,
+    format_article_list,
     format_call,
     format_call_list,
     format_campaign_record_list,
@@ -130,7 +138,12 @@ mcp = FastMCP(
         "- Use list_realtime_sessions to see which agents are currently online and their status.\n"
         "- When listing activities, always specify type and/or date range to keep results focused.\n"
         "- Dates in YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS' format.\n"
-        "- Pagination: use skip + take. Max take=1000. Default take=50.\n\n"
+        "- Pagination: use skip + take. Max take=1000. Default take=50.\n"
+        "- **Complete data retrieval**: after each list call, check the `total` in the response. "
+        "If you retrieved fewer records than the total, paginate using `skip` (e.g. skip=200, skip=400) "
+        "with `take=200` until all records are retrieved. Never draw conclusions from a partial dataset "
+        "without explicitly noting how many records were not analyzed. "
+        "For comprehensive analysis requests, always retrieve and analyze all matching records.\n\n"
 
         "## Custom fields\n"
         "Tickets, activities, contacts, accounts, CRM records, and campaign records can all have "
@@ -169,13 +182,45 @@ mcp = FastMCP(
         "Check handle time, missed calls, response patterns.\n"
         "- **Customer deep-dive**: find contact → list their open tickets → "
         "get_ticket_detail on each to read the conversation history.\n"
+        "- **Investigating a flagged item from scan results**: When scan_calls or scan_emails "
+        "flags an issue and the user asks for more details or context: "
+        "(1) Read the full content: get_call_transcript (calls) or get_email (emails). "
+        "(2) Get the ticket context: get_ticket_detail on the linked ticket — shows full "
+        "conversation thread and all activities. "
+        "(3) Find the customer's account: the ticket or contact reveals the company name. "
+        "(4) Review recent account history: list_account_tickets(account='company name', "
+        "date_from='<60 days ago>') to find recent tickets across all channels. "
+        "(5) Read key tickets: get_ticket_detail on the most relevant recent tickets. "
+        "The current interaction rarely tells the full story — always check the broader "
+        "account context for churn risk, lost deals, and escalation flags.\n"
         "- **Operational health**: check missed calls (last 7 days), realtime agent sessions, "
         "SLA breaches on open tickets.\n"
         "- **Communication quality**: use get_ticket_detail or get_email to read actual content "
         "for sentiment analysis, quality assessment, or escalation detection.\n"
-        "- **Call quality / management attention**: use list_call_transcripts(date_from=..., take=10) "
-        "to get recent calls with full dialogue, then analyze transcripts for customer frustration, "
-        "escalation requests, compliance issues, or exceptional service.\n\n"
+        "- **Call quality / management attention**: use **scan_calls** for any question that "
+        "requires analyzing many calls — it scores calls server-side using AI and returns "
+        "a compact ranked list. Each call scores up to 100 calls. If the first call shows "
+        "more calls remain, call scan_calls again with skip=100, skip=200, etc. — call ALL "
+        "remaining pages IN PARALLEL for best speed. Then use get_call_transcript to read "
+        "the full dialogue of specific flagged calls. "
+        "Only use list_call_transcripts for small samples (5-10 calls).\n"
+        "- **Email quality / management attention**: use **scan_emails** the same way as "
+        "scan_calls but for email analysis. Scores email subject + body server-side. "
+        "Paginate with skip/take and call remaining pages IN PARALLEL.\n"
+        "- **Agent coaching / performance comparison**: use scan_calls or scan_emails with a "
+        "question focused on communication quality, e.g. 'Evaluate agent communication: "
+        "empathy, clarity, problem resolution, professionalism'. Compare scores across agents.\n\n"
+
+        "## Knowledge base articles\n"
+        "- **Search articles**: use list_articles(search='keyword') — searches across title, "
+        "description, content, and tags using Daktela's global search.\n"
+        "- **Browse by folder**: use list_article_folders to see the folder hierarchy, "
+        "then list_articles(folder='folder name') to see articles in a specific folder.\n"
+        "- **Read article content**: use get_article(name='article_id') to get the full "
+        "article with HTML content converted to Markdown.\n"
+        "- **Ticket resolution workflow**: when helping resolve a ticket, extract keywords "
+        "from the customer's question → search KB with list_articles → read matching articles "
+        "with get_article → use the content to answer.\n\n"
 
         "## Data presentation\n"
         "Always choose the richest appropriate format — default to visual when the data supports it.\n\n"
@@ -1895,6 +1940,642 @@ async def list_realtime_sessions(
     async with _get_client() as client:
         result = await client.list("realtimeSessions", skip=skip, take=take)
     return format_realtime_session_list(result["data"], result["total"], skip, take)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base tools
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_folder(client: DaktelaClient, folder_input: str) -> tuple[str, str | None]:
+    """Resolve a folder display name or ID to (folder_id, display_title).
+
+    If folder_input looks like an internal ID (starts with 'folder_'), use as-is.
+    Otherwise search by title and return the best match.
+    """
+    if folder_input.startswith("folder_"):
+        return folder_input, None
+    result = await client.list(
+        "articlesFolders",
+        field_filters=[("title", "like", folder_input)],
+        take=10,
+        fields=["name", "title"],
+    )
+    if result["data"]:
+        for f in result["data"]:
+            if f.get("title", "").strip().lower() == folder_input.strip().lower():
+                return f["name"], f.get("title")
+        return result["data"][0]["name"], result["data"][0].get("title")
+    return folder_input, None
+
+
+async def _resolve_tag(client: DaktelaClient, tag_input: str) -> tuple[str, str | None]:
+    """Resolve a tag display name or ID to (tag_id, display_title).
+
+    If tag_input looks like an internal ID (starts with 'tag_'), use as-is.
+    Otherwise search by title and return the best match.
+    """
+    if tag_input.startswith("tag_"):
+        return tag_input, None
+    result = await client.list(
+        "articlesTags",
+        field_filters=[("title", "like", tag_input)],
+        take=10,
+        fields=["name", "title"],
+    )
+    if result["data"]:
+        for t in result["data"]:
+            if t.get("title", "").strip().lower() == tag_input.strip().lower():
+                return t["name"], t.get("title")
+        return result["data"][0]["name"], result["data"][0].get("title")
+    return tag_input, None
+
+
+@mcp.tool()
+async def list_article_folders(
+    skip: int = 0,
+    take: int = 200,
+) -> str:
+    """List all knowledge base article folders in a tree structure.
+
+    Returns a hierarchical view of folders with article counts.
+    Use the folder 'name' field to filter articles by folder in list_articles.
+
+    Args:
+        skip: Pagination offset (default: 0).
+        take: Number of records to return (default: 200).
+    """
+    async with _get_client() as client:
+        result = await client.list("articlesFolders", skip=skip, take=take)
+    return format_article_folder_tree(result["data"])
+
+
+@mcp.tool()
+async def list_articles(
+    search: str | None = None,
+    folder: str | None = None,
+    tag: str | None = None,
+    published: str | None = None,
+    skip: int = 0,
+    take: int = 10,
+) -> str:
+    """Search and list knowledge base articles.
+
+    Use this to find relevant KB articles by keyword, folder, or tag.
+    The search parameter uses Daktela's global search (q=) which searches
+    across title, description, content, and tags.
+
+    Args:
+        search: Full-text search across article title, description, content, and tags.
+            Uses Daktela's global search — the most effective way to find articles.
+        folder: Filter by folder — pass a folder name (human-readable) or internal ID.
+            Folder names are resolved automatically.
+        tag: Filter by tag — pass a tag title (human-readable) or internal ID.
+            Tag titles are resolved automatically.
+        published: Filter by published status: 'true' or 'false'.
+        skip: Pagination offset (default: 0).
+        take: Number of articles to return (default: 10, max: 200).
+            Default is smaller than other tools because article records are larger.
+    """
+    take = min(take, _MAX_TAKE_DATA)
+    async with _get_client() as client:
+        if folder and not folder.startswith("folder_"):
+            folder, _ = await _resolve_folder(client, folder)
+        if tag and not tag.startswith("tag_"):
+            tag, _ = await _resolve_tag(client, tag)
+
+        filters: list[tuple[str, str, str]] = []
+        if folder:
+            filters.append(("folder", "eq", folder))
+        if tag:
+            filters.append(("tags", "eq", tag))
+        if published is not None:
+            filters.append(("published", "eq", published))
+
+        result = await client.list(
+            "articles",
+            field_filters=filters or None,
+            skip=skip,
+            take=take,
+            search=search,
+            fields=["name", "title", "folder", "tags", "description", "created", "edited"],
+        )
+    return format_article_list(
+        result["data"], result["total"], skip, take, base_url=_get_base_url(),
+    )
+
+
+@mcp.tool()
+async def get_article(name: str) -> str:
+    """Get full details of a single knowledge base article by its ID.
+
+    Returns the article with its HTML content converted to clean Markdown,
+    including headers, links, lists, and code blocks. Use this to read
+    the full content of an article found via list_articles.
+
+    Args:
+        name: The article ID (the 'name' field from list_articles).
+    """
+    async with _get_client() as client:
+        record = await client.get("articles", name)
+    if record is None:
+        return f"Article '{name}' not found."
+    return format_article(record, base_url=_get_base_url(), detail=True)
+
+
+# ---------------------------------------------------------------------------
+# Analysis tools — server-side LLM scoring for large-volume queries
+# ---------------------------------------------------------------------------
+
+
+_SCAN_PAGE_SIZE = 100  # calls per scan_calls invocation
+
+
+@mcp.tool()
+async def scan_calls(
+    date_from: str,
+    date_to: str | None = None,
+    user: str | None = None,
+    queue: str | None = None,
+    question: str = "Flag calls needing management attention: angry customers, escalation requests, compliance issues, lost deals, missed commitments.",
+    skip: int = 0,
+    take: int = _SCAN_PAGE_SIZE,
+    ctx: Context | None = None,
+) -> str:
+    """AI-score answered calls in a date range. Returns one page of scored results.
+
+    **IMPORTANT:** Before calling this tool, briefly tell the user that this analysis
+    takes some time because it processes each call with AI (e.g. "Let me analyze your
+    calls — this involves AI-scoring each conversation, so it may take a moment.").
+
+    Fetches a page of calls (default 100), loads their transcripts, scores each with
+    a fast AI model, and returns a compact ranked list with scores, flags, and summaries.
+
+    **CRITICAL — you MUST scan ALL pages.** The first 100 results are NOT representative
+    of the full dataset. Important issues may appear in any page. If the response shows
+    remaining records, you MUST call all remaining pages (in parallel) before presenting
+    results. Never skip pages or stop early — partial analysis gives unreliable results.
+
+    **Pagination:** Each call returns up to `take` scored records and reports the total.
+    If total > take, call ALL remaining pages IN PARALLEL:
+    - First call: scan_calls(date_from='2026-02-20') → returns 100 scored + "350 total"
+    - Then IN PARALLEL: scan_calls(..., skip=100), scan_calls(..., skip=200), scan_calls(..., skip=300)
+
+    After reviewing scored results, use get_call_transcript to read full dialogue
+    of specific flagged calls.
+
+    Args:
+        date_from: Start date (YYYY-MM-DD). Required.
+        date_to: End date (YYYY-MM-DD). Defaults to same as date_from (single day).
+        user: Agent name — display name or login name, resolved automatically.
+        queue: Queue internal name (e.g. '10333').
+        question: What to analyze for. Be specific about what to flag.
+        skip: Pagination offset (default: 0). Use to fetch subsequent pages.
+        take: Number of calls to score in this page (default: 100, max: 200).
+    """
+    from mcp_daktela.scorer import score_conversations
+
+    if date_to is None:
+        date_to = date_from
+    take = min(take, 200)  # hard cap per page
+
+    # Progress callback using MCP context
+    async def _progress(completed: int, total: int, message: str) -> None:
+        if ctx and isinstance(ctx, Context):
+            await ctx.report_progress(completed, total, message)
+            await ctx.info(message)
+
+    async with _get_client() as client:
+        if user:
+            user, _ = await _resolve_user(client, user)
+
+        # Step 1: Fetch one page of answered calls
+        filters: list[tuple[str, str, str]] = [("answered", "eq", "true")]
+        if queue:
+            filters.append(("id_queue", "eq", queue))
+        if user:
+            filters.append(("id_agent", "eq", user))
+        filters.extend(_date_filters("call_time", date_from, date_to))
+
+        result = await client.list(
+            "activitiesCall",
+            field_filters=filters,
+            skip=skip,
+            take=take,
+            sort="call_time",
+            sort_dir="desc",
+            fields=[
+                "id_call", "call_time", "direction", "answered",
+                "id_queue", "id_agent", "clid", "duration",
+                "activities",
+            ],
+        )
+        page_calls = result["data"]
+        total_calls = result["total"]
+
+        if not page_calls:
+            if skip == 0:
+                return f"No answered calls found for {date_from} to {date_to}."
+            return f"No more calls (skip={skip} exceeds total={total_calls})."
+
+        if ctx and isinstance(ctx, Context):
+            await ctx.info(
+                f"Fetched calls {skip + 1}-{skip + len(page_calls)} "
+                f"of {total_calls}, loading transcripts..."
+            )
+
+        # Step 2: Extract activity names and fetch transcripts in parallel
+        activity_names: list[str | None] = []
+        for call in page_calls:
+            activities = call.get("activities")
+            if activities and isinstance(activities, list) and activities:
+                activity_names.append(_extract_id(activities[0]) or None)
+            else:
+                activity_names.append(None)
+
+        sem = asyncio.Semaphore(10)
+
+        async def _fetch_transcript(act_name: str | None) -> str:
+            if not act_name:
+                return ""
+            async with sem:
+                res = await client.list(
+                    "activitiesCallTranscripts",
+                    field_filters=[("activity", "eq", act_name)],
+                    skip=0,
+                    take=200,
+                    sort="start",
+                    sort_dir="asc",
+                    fields=["text", "type", "start", "end"],
+                )
+                segments = res["data"]
+                if not segments:
+                    return ""
+                sorted_segs = sorted(segments, key=lambda s: float(s.get("start") or 0))
+                lines = []
+                for seg in sorted_segs:
+                    seg_type = (seg.get("type") or "").lower()
+                    speaker = "Customer" if seg_type == "customer" else "Operator"
+                    text = (seg.get("text") or "").strip()
+                    if text:
+                        lines.append(f"{speaker}: {text}")
+                return "\n".join(lines)
+
+        transcript_texts = await asyncio.gather(
+            *[_fetch_transcript(name) for name in activity_names]
+        )
+
+        if ctx and isinstance(ctx, Context):
+            await ctx.info(
+                f"Loaded {sum(1 for t in transcript_texts if t)} transcripts, "
+                f"scoring with AI..."
+            )
+
+    # Step 3: Build scoring records
+    base_url = _get_base_url()
+    scoring_records = []
+    call_metadata: dict[str, dict] = {}
+
+    for i, call in enumerate(page_calls):
+        call_id = str(call.get("id_call") or call.get("name", f"call_{i}"))
+        agent = _extract_name(call.get("id_agent") or call.get("user"))
+        queue_name = _extract_name(call.get("id_queue") or call.get("queue"))
+        ticket_id = _extract_ticket_from_activities(call.get("activities"))
+        ticket_url = _ticket_url(base_url, ticket_id)
+
+        scoring_records.append({
+            "id": call_id,
+            "time": call.get("call_time", ""),
+            "agent": agent,
+            "duration": call.get("duration", ""),
+            "transcript": transcript_texts[i],
+        })
+        call_metadata[call_id] = {
+            "time": call.get("call_time", ""),
+            "agent": agent,
+            "queue": queue_name,
+            "duration": call.get("duration", ""),
+            "direction": call.get("direction", ""),
+            "clid": call.get("clid", ""),
+            "ticket_url": ticket_url or "",
+            "activity": _extract_id(call["activities"][0]) if call.get("activities") else "",
+        }
+
+    # Step 4: Score with Haiku
+    scores = await score_conversations(
+        scoring_records, question, on_progress=_progress,
+    )
+
+    # Step 5: Format compact results
+    flagged = [s for s in scores if s.get("score", 0) >= 3 and s.get("id") != "_meta"]
+    routine = [s for s in scores if 0 < s.get("score", 0) < 3]
+    errors = [s for s in scores if s.get("score", 0) == 0 and s.get("id") != "_meta"]
+
+    flagged.sort(key=lambda s: s.get("score", 0), reverse=True)
+
+    # Pagination header
+    page_end = skip + len(page_calls)
+    remaining = total_calls - page_end
+    parts = []
+
+    if remaining > 0:
+        # Build parallel-call hint — put at TOP so Claude sees it first
+        next_pages = []
+        for s in range(page_end, total_calls, take):
+            next_pages.append(f"scan_calls(date_from='{date_from}', date_to='{date_to}'"
+                              + (f", user='{user}'" if user else "")
+                              + (f", queue='{queue}'" if queue else "")
+                              + f", question='{question[:60]}...', skip={s})")
+        hint = ", ".join(next_pages[:6])
+        if len(next_pages) > 6:
+            hint += f", ... ({len(next_pages)} pages remaining)"
+        parts.append(
+            f"**⚠ INCOMPLETE — DO NOT present results to the user yet.**\n"
+            f"Only {page_end}/{total_calls} calls analyzed so far. "
+            f"{remaining} calls remain unscanned and may contain critical issues "
+            f"unrelated to what is visible here.\n"
+            f"**You MUST call all remaining pages before presenting ANY results:**\n"
+            f"{hint}"
+        )
+
+    parts.append(
+        f"**Scored calls {skip + 1}-{page_end} of {total_calls} total** "
+        f"({date_from} to {date_to})\n"
+        f"Analysis: {question}\n"
+        f"This page: Flagged {len(flagged)} | Routine {len(routine)} | "
+        f"Errors {len(errors)}"
+    )
+
+    if flagged:
+        parts.append("---\n**FLAGGED CALLS (score 3-5, needs review):**\n")
+        for s in flagged:
+            cid = s.get("id", "?")
+            meta_info = call_metadata.get(cid, {})
+            score = s.get("score", 0)
+            flags = ", ".join(s.get("flags", []))
+            summary = s.get("summary", "")
+            priority = "URGENT" if score == 5 else "HIGH" if score == 4 else "REVIEW"
+
+            lines = [f"**[{priority}]** Call {cid}"]
+            if meta_info.get("time"):
+                lines.append(f"  Time: {meta_info['time']}")
+            if meta_info.get("agent"):
+                lines.append(f"  Agent: {meta_info['agent']}")
+            if meta_info.get("queue"):
+                lines.append(f"  Queue: {meta_info['queue']}")
+            if meta_info.get("duration"):
+                lines.append(f"  Duration: {meta_info['duration']}s")
+            if meta_info.get("clid"):
+                lines.append(f"  Caller: {meta_info['clid']}")
+            lines.append(f"  Score: {score}/5 | Flags: {flags}")
+            lines.append(f"  Summary: {summary}")
+            if meta_info.get("ticket_url"):
+                lines.append(f"  Ticket: {meta_info['ticket_url']}")
+            if meta_info.get("activity"):
+                lines.append(
+                    f"  (Use get_call_transcript with activity='{meta_info['activity']}' "
+                    f"for full dialogue)"
+                )
+            parts.append("\n".join(lines))
+
+    if not flagged:
+        parts.append("No calls flagged for attention in this page.")
+
+    if routine:
+        parts.append(
+            f"\n---\n**Routine calls ({len(routine)}):** No issues detected. "
+            f"Average score: {sum(s.get('score', 0) for s in routine) / len(routine):.1f}/5"
+        )
+
+    if errors:
+        parts.append(f"\n**Scoring errors ({len(errors)}):** Could not analyze these calls.")
+
+    return "\n\n".join(parts)
+
+
+@mcp.tool()
+async def scan_emails(
+    date_from: str,
+    date_to: str | None = None,
+    user: str | None = None,
+    queue: str | None = None,
+    direction: str | None = None,
+    question: str = "Flag emails needing management attention: angry customers, escalation requests, compliance issues, lost deals, missed commitments, unresolved complaints.",
+    skip: int = 0,
+    take: int = _SCAN_PAGE_SIZE,
+    ctx: Context | None = None,
+) -> str:
+    """AI-score emails in a date range. Returns one page of scored results.
+
+    **IMPORTANT:** Before calling this tool, briefly tell the user that this analysis
+    takes some time because it processes each email with AI (e.g. "Let me analyze your
+    emails — this involves AI-scoring each one, so it may take a moment.").
+
+    Fetches a page of emails (default 100), scores each with a fast AI model using
+    the email subject and body, and returns a compact ranked list with scores, flags,
+    and summaries.
+
+    **CRITICAL — you MUST scan ALL pages.** The first 100 results are NOT representative
+    of the full dataset. Important issues may appear in any page. If the response shows
+    remaining records, you MUST call all remaining pages (in parallel) before presenting
+    results. Never skip pages or stop early — partial analysis gives unreliable results.
+
+    **Pagination:** Each call returns up to `take` scored records and reports the total.
+    If total > take, call ALL remaining pages IN PARALLEL:
+    - First call: scan_emails(date_from='2026-02-20') → returns 100 scored + "500 total"
+    - Then IN PARALLEL: scan_emails(..., skip=100), scan_emails(..., skip=200), etc.
+
+    After reviewing scored results, use get_email to read the full email content
+    of specific flagged items.
+
+    Args:
+        date_from: Start date (YYYY-MM-DD). Required.
+        date_to: End date (YYYY-MM-DD). Defaults to same as date_from (single day).
+        user: Agent name — display name or login name, resolved automatically.
+        queue: Queue internal name (e.g. '10333').
+        direction: Filter by direction: 'in' (incoming) or 'out' (outgoing).
+        question: What to analyze for. Be specific about what to flag.
+        skip: Pagination offset (default: 0). Use to fetch subsequent pages.
+        take: Number of emails to score in this page (default: 100, max: 200).
+    """
+    from mcp_daktela.scorer import score_conversations
+
+    if date_to is None:
+        date_to = date_from
+    take = min(take, 200)
+    if direction:
+        direction = direction.lower()
+
+    async def _progress(completed: int, total: int, message: str) -> None:
+        if ctx and isinstance(ctx, Context):
+            await ctx.report_progress(completed, total, message)
+            await ctx.info(message)
+
+    async with _get_client() as client:
+        if user:
+            user, _ = await _resolve_user(client, user)
+
+        # Step 1: Fetch one page of emails
+        filters: list[tuple[str, str, str]] = []
+        if queue:
+            filters.append(("queue", "eq", queue))
+        if user:
+            filters.append(("user", "eq", user))
+        if direction:
+            filters.append(("direction", "eq", direction))
+        filters.extend(_date_filters("time", date_from, date_to))
+
+        result = await client.list(
+            "activitiesEmail",
+            field_filters=filters or None,
+            skip=skip,
+            take=take,
+            sort="time",
+            sort_dir="desc",
+            fields=[
+                "name", "queue", "user", "title", "address",
+                "direction", "text", "time", "activities",
+            ],
+        )
+        page_emails = result["data"]
+        total_emails = result["total"]
+
+        if not page_emails:
+            if skip == 0:
+                return f"No emails found for {date_from} to {date_to}."
+            return f"No more emails (skip={skip} exceeds total={total_emails})."
+
+        if ctx and isinstance(ctx, Context):
+            await ctx.info(
+                f"Fetched emails {skip + 1}-{skip + len(page_emails)} "
+                f"of {total_emails}, scoring with AI..."
+            )
+
+    # Step 2: Build scoring records (no separate fetch needed — body is inline)
+    base_url = _get_base_url()
+    scoring_records = []
+    email_metadata: dict[str, dict] = {}
+
+    for i, email in enumerate(page_emails):
+        email_id = email.get("name", f"email_{i}")
+        agent = _extract_name(email.get("user"))
+        queue_name = _extract_name(email.get("queue"))
+        subject = email.get("title", "")
+        address = email.get("address", "")
+        email_dir = email.get("direction", "")
+        raw_body = email.get("text") or ""
+        body = _clean_email_body(raw_body, max_len=3000)
+        ticket_id = _extract_ticket_from_activities(email.get("activities"))
+        ticket_url = _ticket_url(base_url, ticket_id)
+
+        scoring_records.append({
+            "id": email_id,
+            "time": email.get("time", ""),
+            "agent": agent,
+            "subject": subject,
+            "direction": email_dir,
+            "address": address,
+            "body": body,
+        })
+        email_metadata[email_id] = {
+            "time": email.get("time", ""),
+            "agent": agent,
+            "queue": queue_name,
+            "subject": subject,
+            "direction": email_dir,
+            "address": address,
+            "ticket_url": ticket_url or "",
+        }
+
+    # Step 3: Score with Haiku
+    scores = await score_conversations(
+        scoring_records, question, on_progress=_progress, content_type="EMAIL",
+    )
+
+    # Step 4: Format compact results
+    flagged = [s for s in scores if s.get("score", 0) >= 3 and s.get("id") != "_meta"]
+    routine = [s for s in scores if 0 < s.get("score", 0) < 3]
+    errors = [s for s in scores if s.get("score", 0) == 0 and s.get("id") != "_meta"]
+
+    flagged.sort(key=lambda s: s.get("score", 0), reverse=True)
+
+    page_end = skip + len(page_emails)
+    remaining = total_emails - page_end
+    parts = []
+
+    if remaining > 0:
+        next_pages = []
+        for s in range(page_end, total_emails, take):
+            next_pages.append(f"scan_emails(date_from='{date_from}', date_to='{date_to}'"
+                              + (f", user='{user}'" if user else "")
+                              + (f", queue='{queue}'" if queue else "")
+                              + (f", direction='{direction}'" if direction else "")
+                              + f", question='{question[:60]}...', skip={s})")
+        hint = ", ".join(next_pages[:6])
+        if len(next_pages) > 6:
+            hint += f", ... ({len(next_pages)} pages remaining)"
+        parts.append(
+            f"**⚠ INCOMPLETE — DO NOT present results to the user yet.**\n"
+            f"Only {page_end}/{total_emails} emails analyzed so far. "
+            f"{remaining} emails remain unscanned and may contain critical issues "
+            f"unrelated to what is visible here.\n"
+            f"**You MUST call all remaining pages before presenting ANY results:**\n"
+            f"{hint}"
+        )
+
+    parts.append(
+        f"**Scored emails {skip + 1}-{page_end} of {total_emails} total** "
+        f"({date_from} to {date_to})\n"
+        f"Analysis: {question}\n"
+        f"This page: Flagged {len(flagged)} | Routine {len(routine)} | "
+        f"Errors {len(errors)}"
+    )
+
+    if flagged:
+        parts.append("---\n**FLAGGED EMAILS (score 3-5, needs review):**\n")
+        for s in flagged:
+            eid = s.get("id", "?")
+            meta_info = email_metadata.get(eid, {})
+            score = s.get("score", 0)
+            flags = ", ".join(s.get("flags", []))
+            summary = s.get("summary", "")
+            priority = "URGENT" if score == 5 else "HIGH" if score == 4 else "REVIEW"
+
+            lines = [f"**[{priority}]** Email {eid}"]
+            if meta_info.get("subject"):
+                lines.append(f"  Subject: {meta_info['subject']}")
+            if meta_info.get("time"):
+                lines.append(f"  Time: {meta_info['time']}")
+            if meta_info.get("agent"):
+                lines.append(f"  Agent: {meta_info['agent']}")
+            if meta_info.get("address"):
+                lines.append(f"  Address: {meta_info['address']}")
+            if meta_info.get("direction"):
+                lines.append(f"  Direction: {meta_info['direction']}")
+            if meta_info.get("queue"):
+                lines.append(f"  Queue: {meta_info['queue']}")
+            lines.append(f"  Score: {score}/5 | Flags: {flags}")
+            lines.append(f"  Summary: {summary}")
+            if meta_info.get("ticket_url"):
+                lines.append(f"  Ticket: {meta_info['ticket_url']}")
+            lines.append(
+                f"  (Use get_email with name='{eid}' for full content)"
+            )
+            parts.append("\n".join(lines))
+
+    if not flagged:
+        parts.append("No emails flagged for attention in this page.")
+
+    if routine:
+        parts.append(
+            f"\n---\n**Routine emails ({len(routine)}):** No issues detected. "
+            f"Average score: {sum(s.get('score', 0) for s in routine) / len(routine):.1f}/5"
+        )
+
+    if errors:
+        parts.append(f"\n**Scoring errors ({len(errors)}):** Could not analyze these emails.")
+
+    return "\n\n".join(parts)
 
 
 if __name__ == "__main__":

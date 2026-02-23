@@ -25,7 +25,8 @@ import os
 import secrets
 import time
 from base64 import urlsafe_b64encode
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import jwt
@@ -125,10 +126,13 @@ def _get_jwt_secret() -> str:
     return secret
 
 
+_DAKTELA_TZ = ZoneInfo("Europe/Prague")
+
+
 def _parse_daktela_datetime(dt_str: str) -> int:
     """Parse Daktela datetime string to unix timestamp."""
-    # Daktela returns "2026-02-14 23:34:17" (naive, assumed UTC)
-    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    # Daktela returns "2026-02-14 23:34:17" in Europe/Prague local time (CET/CEST)
+    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_DAKTELA_TZ)
     return int(dt.timestamp())
 
 
@@ -426,11 +430,12 @@ def _issue_token_response(
         "daktela_password": password,
         "exp": int(time.time()) + _REFRESH_TOKEN_LIFETIME,
     })
-    # Report expires_in 5 minutes early so the MCP client proactively refreshes
+    # Report expires_in 10 minutes early so the MCP client proactively refreshes
     # before the token actually dies. On a real 401, the MCP SDK does full re-auth
     # (opens browser) rather than a silent refresh_token exchange, so we want the
-    # proactive path to always fire first.
-    expires_in = max(0, access_exp - int(time.time()) - 300)
+    # proactive path to always fire first. 10 min buffer accounts for clock skew
+    # and delayed refresh scheduling.
+    expires_in = max(0, access_exp - int(time.time()) - 600)
     return JSONResponse({
         "access_token": access_token,
         "token_type": "Bearer",

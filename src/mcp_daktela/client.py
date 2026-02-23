@@ -111,13 +111,14 @@ class DaktelaClient:
         sort: str | None = None,
         sort_dir: str = "desc",
         fields: list[str] | None = None,
+        search: str | None = None,
     ) -> dict:
         """Fetch a paginated list from a Daktela endpoint.
 
         Returns:
             dict with keys: "data" (list of records), "total" (int total count)
         """
-        cacheable = field_filters is None and fields is None
+        cacheable = field_filters is None and fields is None and search is None
         if cacheable:
             cached = cache.get(
                 self._cache_identity(), endpoint, skip, take, sort, sort_dir,
@@ -133,6 +134,8 @@ class DaktelaClient:
             sort_dir=sort_dir,
             fields=fields,
         )
+        if search:
+            params["q"] = search
         resp = await self._request("GET", self._url(endpoint), params=params)
         resp.raise_for_status()
         body = resp.json()

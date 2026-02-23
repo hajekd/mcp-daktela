@@ -84,6 +84,9 @@ _get_ticket_detail = server.get_ticket_detail.fn
 _get_call_transcript = server.get_call_transcript.fn
 _list_call_transcripts = server.list_call_transcripts.fn
 _list_realtime_sessions = server.list_realtime_sessions.fn
+_list_article_folders = server.list_article_folders.fn
+_list_articles = server.list_articles.fn
+_get_article = server.get_article.fn
 
 
 class TestListTickets:
@@ -1351,12 +1354,181 @@ class TestListCallTranscripts:
         assert len(transcript_calls) == 3
 
 
+class TestListArticleFolders:
+    async def test_returns_formatted_output(self):
+        client = _make_mock_client(list_result={
+            "data": [
+                {"name": "folder_1", "title": "General", "parent": None, "article_count": 5},
+            ],
+            "total": 1,
+        })
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            result = await _list_article_folders()
+
+        assert "folder_1" in result
+        assert "General" in result
+        client.list.assert_called_once_with("articlesFolders", skip=0, take=200)
+
+    async def test_empty_result(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            result = await _list_article_folders()
+
+        assert "No article folders found" in result
+
+
+class TestListArticles:
+    async def test_search_uses_q_parameter(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(search="sip trunk")
+
+        call_kwargs = client.list.call_args[1]
+        assert call_kwargs["search"] == "sip trunk"
+
+    async def test_folder_resolution(self):
+        call_count = 0
+
+        async def list_side_effect(endpoint, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if endpoint == "articlesFolders":
+                return {"data": [{"name": "folder_tel", "title": "Telephony"}], "total": 1}
+            if endpoint == "articles":
+                return {"data": [], "total": 0}
+            return {"data": [], "total": 0}
+
+        client = _make_mock_client()
+        client.list.side_effect = list_side_effect
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(folder="Telephony")
+
+        # The articles call should use the resolved folder ID
+        articles_call = [c for c in client.list.call_args_list if c[0][0] == "articles"][0]
+        filters = articles_call[1]["field_filters"]
+        assert ("folder", "eq", "folder_tel") in filters
+
+    async def test_folder_id_passed_directly(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(folder="folder_abc")
+
+        call_kwargs = client.list.call_args[1]
+        filters = call_kwargs["field_filters"]
+        assert ("folder", "eq", "folder_abc") in filters
+        # Should NOT have called articlesFolders endpoint
+        assert all(c[0][0] != "articlesFolders" for c in client.list.call_args_list)
+
+    async def test_tag_resolution(self):
+        call_count = 0
+
+        async def list_side_effect(endpoint, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if endpoint == "articlesTags":
+                return {"data": [{"name": "tag_sip", "title": "SIP"}], "total": 1}
+            if endpoint == "articles":
+                return {"data": [], "total": 0}
+            return {"data": [], "total": 0}
+
+        client = _make_mock_client()
+        client.list.side_effect = list_side_effect
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(tag="SIP")
+
+        articles_call = [c for c in client.list.call_args_list if c[0][0] == "articles"][0]
+        filters = articles_call[1]["field_filters"]
+        assert ("tags", "eq", "tag_sip") in filters
+
+    async def test_published_filter(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(published="true")
+
+        call_kwargs = client.list.call_args[1]
+        filters = call_kwargs["field_filters"]
+        assert ("published", "eq", "true") in filters
+
+    async def test_default_take_is_10(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles()
+
+        call_kwargs = client.list.call_args[1]
+        assert call_kwargs["take"] == 10
+
+    async def test_take_capped_at_max(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles(take=500)
+
+        call_kwargs = client.list.call_args[1]
+        assert call_kwargs["take"] == 200
+
+    async def test_uses_correct_endpoint(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles()
+
+        assert client.list.call_args[0][0] == "articles"
+
+    async def test_empty_result(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            result = await _list_articles()
+
+        assert "No articles found" in result
+
+    async def test_requests_correct_fields(self):
+        client = _make_mock_client()
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _list_articles()
+
+        call_kwargs = client.list.call_args[1]
+        fields = call_kwargs["fields"]
+        assert "name" in fields
+        assert "title" in fields
+        assert "content" not in fields  # NOT in list mode
+
+
+class TestGetArticle:
+    async def test_found(self):
+        client = _make_mock_client(get_result={
+            "name": "article_001",
+            "title": "SIP Trunk Setup",
+            "content": "<h1>Setup</h1><p>Instructions here.</p>",
+            "seen_count": 10,
+        })
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            result = await _get_article(name="article_001")
+
+        assert "article_001" in result
+        assert "SIP Trunk Setup" in result
+        assert "Setup" in result
+        assert "Instructions here" in result
+        client.get.assert_called_once_with("articles", "article_001")
+
+    async def test_not_found(self):
+        client = _make_mock_client(get_result=None)
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            result = await _get_article(name="nonexistent")
+
+        assert "not found" in result
+
+    async def test_uses_correct_endpoint(self):
+        client = _make_mock_client(get_result={"name": "a1", "title": "Test"})
+        with patch(MOCK_CLIENT_PATH, return_value=client):
+            await _get_article(name="a1")
+
+        client.get.assert_called_once_with("articles", "a1")
+
+
 class TestToolRegistration:
     """Verify all tools are registered with the MCP server."""
 
     def test_tool_count(self):
         tools = server.mcp._tool_manager._tools
-        assert len(tools) == 40
+        assert len(tools) == 45
 
     def test_tool_names(self):
         tools = server.mcp._tool_manager._tools
@@ -1401,5 +1573,10 @@ class TestToolRegistration:
             "list_statuses",
             "list_templates",
             "list_realtime_sessions",
+            "scan_calls",
+            "scan_emails",
+            "list_article_folders",
+            "list_articles",
+            "get_article",
         }
         assert set(tools.keys()) == expected

@@ -1,7 +1,10 @@
 """Format Daktela API records into readable text for Claude."""
 
+import html as html_mod
 import re
 from typing import Any
+
+import markdownify as md
 
 MAX_DESCRIPTION_LENGTH = 300
 
@@ -46,6 +49,58 @@ def _truncate(text: str | None, max_len: int = MAX_DESCRIPTION_LENGTH) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "..."
+
+
+def _clean_email_body(text: str | None, max_len: int = 1500) -> str:
+    """Extract readable text from an email body (often HTML).
+
+    Strips HTML tags, removes quoted reply chains and signatures,
+    then truncates to max_len characters of clean text.
+    Pass max_len=0 to skip truncation (used for detail mode).
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+
+    # --- Strip HTML ---
+    # Remove <style> and <script> blocks entirely
+    s = re.sub(r'<style[^>]*>.*?</style>', '', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'<script[^>]*>.*?</script>', '', s, flags=re.IGNORECASE | re.DOTALL)
+    # Convert block elements to newlines
+    s = re.sub(r'<br\s*/?\s*>', '\n', s, flags=re.IGNORECASE)
+    s = re.sub(r'</?(p|div|tr|li|h[1-6]|blockquote)[^>]*>', '\n', s, flags=re.IGNORECASE)
+    # Remove all remaining HTML tags
+    s = re.sub(r'<[^>]+>', '', s)
+    # Decode HTML entities
+    s = html_mod.unescape(s)
+
+    # --- Remove quoted reply chains ---
+    # "On <date> <name> wrote:" and everything after
+    s = re.sub(r'\n\s*On .{10,120} wrote:\s*\n.*', '', s, flags=re.DOTALL)
+    # "Dne <date> <name> napsal:" (Czech variant)
+    s = re.sub(r'\n\s*Dne .{10,120} napsal[/a]?:\s*\n.*', '', s, flags=re.DOTALL)
+    # Lines starting with > (quoted text)
+    lines = s.split('\n')
+    lines = [line for line in lines if not line.strip().startswith('>')]
+    s = '\n'.join(lines)
+
+    # --- Remove email signatures ---
+    # Standard signature delimiter: "-- " on its own line
+    sig_match = re.search(r'\n-- ?\n', s)
+    if sig_match:
+        s = s[:sig_match.start()]
+
+    # --- Collapse whitespace ---
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    s = re.sub(r'[ \t]{2,}', ' ', s)
+    s = s.strip()
+
+    # --- Truncate ---
+    if max_len and len(s) > max_len:
+        return s[:max_len] + "..."
+    return s
 
 
 def _format_statuses(statuses: Any) -> str:
@@ -526,7 +581,7 @@ def format_email(record: dict, base_url: str | None = None, detail: bool = False
     wait_time = record.get("wait_time", "")
     created = record.get("time", "")
     raw_text = record.get("text") or ""
-    text = raw_text.strip() if detail else _truncate(raw_text, 500)
+    text = _clean_email_body(raw_text, max_len=0) if detail else _clean_email_body(raw_text)
 
     # Extract ticket reference from linked activities
     ticket_name = _extract_ticket_from_activities(record.get("activities"))
@@ -946,3 +1001,158 @@ def format_realtime_session_list(records: list[dict], total: int, skip: int, tak
     if skip + len(records) < total:
         footer = f"\n\n(Use skip={skip + len(records)} to see next page)"
     return header + body + footer
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base article formatters
+# ---------------------------------------------------------------------------
+
+
+def _html_to_markdown(html_content: str, base_url: str | None = None) -> str:
+    """Convert HTML article content to clean Markdown.
+
+    Prepends base_url to relative URLs, strips style/script blocks,
+    and collapses excessive whitespace.
+    """
+    if not html_content:
+        return ""
+
+    s = html_content
+
+    # Strip style and script blocks before conversion
+    s = re.sub(r'<style[^>]*>.*?</style>', '', s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r'<script[^>]*>.*?</script>', '', s, flags=re.IGNORECASE | re.DOTALL)
+
+    # Prepend base_url to relative href/src attributes
+    if base_url:
+        base = base_url.rstrip("/")
+        s = re.sub(r'(href|src)="/', rf'\1="{base}/', s, flags=re.IGNORECASE)
+
+    # Convert to markdown
+    result = md.markdownify(s, heading_style="ATX", strip=["img"])
+
+    # Collapse excessive whitespace
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = result.strip()
+    return result
+
+
+_ARTICLE_KNOWN_KEYS = {
+    "name", "title", "folder", "tags", "description", "content",
+    "created", "edited", "seen_count", "published",
+}
+
+
+def format_article(
+    record: dict, base_url: str | None = None, detail: bool = False,
+) -> str:
+    """Format a knowledge base article for display."""
+    name = record.get("name", "?")
+    title = record.get("title", "No title")
+    folder = _extract_name(record.get("folder"))
+    description = record.get("description") or ""
+    created = record.get("created", "")
+    edited = record.get("edited", "")
+
+    # Tags can be a list of dicts or strings
+    tags_raw = record.get("tags")
+    if tags_raw and isinstance(tags_raw, list):
+        tag_names = [_extract_name(t) for t in tags_raw if _extract_name(t)]
+    else:
+        tag_names = []
+
+    lines = [f"**{name}** - {title}"]
+
+    if detail and base_url:
+        url = f"{base_url.rstrip('/')}/articles/update/{name}"
+        lines.append(f"  URL: {url}")
+
+    if folder:
+        lines.append(f"  Folder: {folder}")
+    if tag_names:
+        lines.append(f"  Tags: {', '.join(tag_names)}")
+    if created:
+        lines.append(f"  Created: {created}")
+    if edited:
+        lines.append(f"  Last edited: {edited}")
+
+    if detail:
+        seen_count = record.get("seen_count")
+        if seen_count is not None:
+            lines.append(f"  Views: {seen_count}")
+
+        content_html = record.get("content") or ""
+        content_md = _html_to_markdown(content_html, base_url=base_url)
+        if content_md:
+            lines.append(f"\n{content_md}")
+        elif description:
+            lines.append(f"  Description: {description.strip()}")
+    else:
+        if description:
+            lines.append(f"  Description: {_truncate(description)}")
+
+    lines.extend(_format_custom_fields(record))
+    lines.extend(_format_extra_fields(record, _ARTICLE_KNOWN_KEYS))
+    return "\n".join(lines)
+
+
+def format_article_list(
+    records: list[dict], total: int, skip: int, take: int,
+    base_url: str | None = None,
+) -> str:
+    if not records:
+        return "No articles found."
+
+    header = f"Showing {skip + 1}-{skip + len(records)} of {total} articles:\n"
+    body = "\n\n".join(format_article(r, base_url=base_url) for r in records)
+    footer = ""
+    if skip + len(records) < total:
+        footer = f"\n\n(Use skip={skip + len(records)} to see next page)"
+    return header + body + footer
+
+
+def format_article_folder_tree(records: list[dict]) -> str:
+    """Build a visual indented tree from a flat list of article folders.
+
+    Each folder has: name, title, parent (dict/string/None), article_count.
+    """
+    if not records:
+        return "No article folders found."
+
+    # Build lookup structures
+    by_name: dict[str, dict] = {}
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+
+    for r in records:
+        fname = r.get("name", "?")
+        by_name[fname] = r
+        parent_id = _extract_id(r.get("parent"))
+        if parent_id:
+            children.setdefault(parent_id, []).append(fname)
+        else:
+            roots.append(fname)
+
+    # Collect orphans (parent references a folder not in our list)
+    all_names = set(by_name.keys())
+    for fname, rec in by_name.items():
+        parent_id = _extract_id(rec.get("parent"))
+        if parent_id and parent_id not in all_names and fname not in roots:
+            roots.append(fname)
+
+    lines = [f"Article folders ({len(records)} total):\n"]
+
+    def _render(name: str, depth: int) -> None:
+        rec = by_name.get(name, {})
+        title = rec.get("title", "")
+        count = rec.get("article_count", "")
+        indent = "  " * depth
+        count_str = f" ({count} articles)" if count else ""
+        lines.append(f"{indent}- **{name}** {title}{count_str}")
+        for child in children.get(name, []):
+            _render(child, depth + 1)
+
+    for root in roots:
+        _render(root, 0)
+
+    return "\n".join(lines)

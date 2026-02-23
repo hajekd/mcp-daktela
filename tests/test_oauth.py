@@ -79,7 +79,8 @@ class TestJwtHelpers:
     def test_parse_daktela_datetime(self):
         ts = _parse_daktela_datetime("2026-02-14 23:34:17")
         assert ts > 0
-        assert ts == 1771112057
+        # Europe/Prague is CET (UTC+1) in February → 3600s less than UTC
+        assert ts == 1771108457
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +443,7 @@ class TestOAuthGateMiddleware:
 
 
 class TestExpiresInBuffer:
-    """Verify that expires_in is reported conservatively (5 min early)."""
+    """Verify that expires_in is reported conservatively (10 min early)."""
 
     async def test_expires_in_has_buffer(self):
         verifier, challenge = _make_pkce_pair()
@@ -458,9 +459,9 @@ class TestExpiresInBuffer:
         resp = await handle_token(request)
         body = json.loads(resp.body)
 
-        # expires_in should be ~2h minus 5min buffer (6900), not the full 7200
-        assert body["expires_in"] <= 7200 - 300 + 5  # +5s tolerance for test runtime
-        assert body["expires_in"] >= 7200 - 300 - 5
+        # expires_in should be ~2h minus 10min buffer (6600), not the full 7200
+        assert body["expires_in"] <= 7200 - 600 + 5  # +5s tolerance for test runtime
+        assert body["expires_in"] >= 7200 - 600 - 5
 
 
 class TestBearerTokenMiddleware:

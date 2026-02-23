@@ -258,6 +258,14 @@ async def main(daktela_url: str, username: str, password: str, server: str) -> i
         ("list_call_transcripts (last 7 days)", "list_call_transcripts", {"date_from": "2026-02-09", "take": 3}),
     ])
 
+    # ── Knowledge base ─────────────────────────────────────────────────
+    await run_group(suite, headers, server, "Knowledge base", [
+        ("list_article_folders",                "list_article_folders",  {}),
+        ("list_articles (take=3)",              "list_articles",         {"take": 3}),
+        ("list_articles (search='sip')",        "list_articles",         {"search": "sip", "take": 3}),
+        ("get_article (nonexistent)",           "get_article",           {"name": "article_nonexistent_xyz"}),
+    ])
+
     # ── Realtime ─────────────────────────────────────────────────────────
     await run_group(suite, headers, server, "Realtime", [
         ("list_realtime_sessions", "list_realtime_sessions", {}),

@@ -1,8 +1,10 @@
 from mcp_daktela.formatting import (
+    _clean_email_body,
     _extract_name,
     _format_custom_fields,
     _format_extra_fields,
     _format_value,
+    _html_to_markdown,
     _linked_name,
     _readable_label,
     _ticket_url,
@@ -10,6 +12,9 @@ from mcp_daktela.formatting import (
     format_account,
     format_activity,
     format_activity_list,
+    format_article,
+    format_article_folder_tree,
+    format_article_list,
     format_call,
     format_campaign_record,
     format_chat,
@@ -57,6 +62,126 @@ class TestTruncate:
 
     def test_empty(self):
         assert _truncate("") == ""
+
+
+class TestCleanEmailBody:
+    def test_none(self):
+        assert _clean_email_body(None) == ""
+
+    def test_empty(self):
+        assert _clean_email_body("") == ""
+
+    def test_plain_text_passthrough(self):
+        assert _clean_email_body("Hello, how are you?") == "Hello, how are you?"
+
+    def test_strips_html_tags(self):
+        html = "<p>Hello <b>world</b></p>"
+        result = _clean_email_body(html)
+        assert "Hello" in result
+        assert "world" in result
+        assert "<" not in result
+
+    def test_br_to_newline(self):
+        result = _clean_email_body("line1<br>line2<br/>line3")
+        assert "line1\nline2\nline3" in result
+
+    def test_block_elements_to_newline(self):
+        result = _clean_email_body("<div>block1</div><div>block2</div>")
+        assert "block1" in result
+        assert "block2" in result
+        assert "<div>" not in result
+
+    def test_strips_style_blocks(self):
+        html = "<style>.foo { color: red; }</style><p>Content here</p>"
+        result = _clean_email_body(html)
+        assert "Content here" in result
+        assert "color" not in result
+        assert ".foo" not in result
+
+    def test_strips_script_blocks(self):
+        html = "<script>alert('xss')</script><p>Safe content</p>"
+        result = _clean_email_body(html)
+        assert "Safe content" in result
+        assert "alert" not in result
+
+    def test_decodes_html_entities(self):
+        result = _clean_email_body("Tom &amp; Jerry &lt;3")
+        assert "Tom & Jerry <3" in result
+
+    def test_removes_quoted_reply_on_wrote(self):
+        body = "Thanks for the update.\n\nOn Mon, Feb 17, 2026 John Doe wrote:\n> Original message\n> More quoted text"
+        result = _clean_email_body(body)
+        assert "Thanks for the update" in result
+        assert "Original message" not in result
+
+    def test_removes_quoted_reply_czech_variant(self):
+        body = "Dekuji za info.\n\nDne 17.2.2026 Jan Novak napsal:\n> Puvodni zprava"
+        result = _clean_email_body(body)
+        assert "Dekuji za info" in result
+        assert "Puvodni zprava" not in result
+
+    def test_removes_gt_quoted_lines(self):
+        body = "My reply\n> quoted line 1\n> quoted line 2\nMore of my reply"
+        result = _clean_email_body(body)
+        assert "My reply" in result
+        assert "More of my reply" in result
+        assert "quoted line" not in result
+
+    def test_removes_signature(self):
+        body = "Please see attached.\n\n-- \nJohn Doe\nSales Manager\n+1 555 1234"
+        result = _clean_email_body(body)
+        assert "Please see attached" in result
+        assert "Sales Manager" not in result
+        assert "+1 555 1234" not in result
+
+    def test_truncates_to_max_len(self):
+        body = "x" * 2000
+        result = _clean_email_body(body, max_len=1500)
+        assert len(result) == 1503  # 1500 + "..."
+        assert result.endswith("...")
+
+    def test_no_truncation_when_under_limit(self):
+        body = "Short email body"
+        result = _clean_email_body(body, max_len=1500)
+        assert result == "Short email body"
+        assert "..." not in result
+
+    def test_no_truncation_with_max_len_zero(self):
+        body = "x" * 3000
+        result = _clean_email_body(body, max_len=0)
+        assert len(result) == 3000
+        assert "..." not in result
+
+    def test_collapses_excessive_whitespace(self):
+        body = "para1\n\n\n\n\npara2"
+        result = _clean_email_body(body)
+        assert "para1\n\npara2" == result
+
+    def test_realistic_html_email(self):
+        html = """<html><head><style>.ExternalClass { width: 100%; }</style></head>
+        <body><div style="font-family: Arial;">
+        <p>Hi David,</p>
+        <p>I wanted to follow up on our conversation about the <b>contract renewal</b>.
+        The deadline is approaching and we haven't received a response yet.</p>
+        <p>Could you please confirm by Friday?</p>
+        <p>Best regards,</p>
+        </div>
+        <div class="gmail_quote">
+        <div>On Mon, Feb 10, 2026 at 3:15 PM David Hajek wrote:</div>
+        <blockquote>
+        <p>Thanks for sending over the proposal.</p>
+        </blockquote>
+        </div></body></html>"""
+        result = _clean_email_body(html)
+        assert "contract renewal" in result
+        assert "confirm by Friday" in result
+        assert "ExternalClass" not in result
+        assert "<p>" not in result
+
+    def test_default_max_len_is_1500(self):
+        body = "a" * 2000
+        result = _clean_email_body(body)
+        assert len(result) == 1503  # 1500 + "..."
 
 
 class TestTicketUrl:
@@ -399,15 +524,27 @@ class TestEmailText:
         result = format_email(email)
         assert "Body: Dear support, I need assistance." in result
 
-    def test_body_truncated(self):
+    def test_body_truncated_at_1500(self):
         email = {
             "name": "ACT001",
-            "text": "z" * 600,
+            "text": "z" * 2000,
         }
         result = format_email(email)
         assert "Body: " in result
         assert "..." in result
-        assert result.count("z") == 500
+        assert result.count("z") == 1500
+
+    def test_html_body_cleaned(self):
+        email = {
+            "name": "ACT001",
+            "text": "<p>Hello <b>world</b></p><style>.x{}</style>",
+        }
+        result = format_email(email)
+        assert "Body: " in result
+        assert "Hello" in result
+        assert "world" in result
+        assert "<p>" not in result
+        assert "<style>" not in result
 
     def test_custom_fields_in_email(self):
         email = {
@@ -449,19 +586,27 @@ class TestDetailMode:
         assert "..." in result
         assert result.count("q") == 500
 
-    def test_email_body_not_truncated(self):
-        long_text = "m" * 800
+    def test_email_body_not_truncated_in_detail(self):
+        long_text = "m" * 2000
         email = {"name": "ACT001", "text": long_text}
         result = format_email(email, detail=True)
         assert "..." not in result
-        assert result.count("m") == 800
+        assert result.count("m") == 2000
 
-    def test_email_body_truncated_by_default(self):
-        long_text = "m" * 800
+    def test_email_body_truncated_at_1500_by_default(self):
+        long_text = "m" * 2000
         email = {"name": "ACT001", "text": long_text}
         result = format_email(email)
         assert "..." in result
-        assert result.count("m") == 500
+        assert result.count("m") == 1500
+
+    def test_email_html_cleaned_in_detail(self):
+        html = "<p>Important <b>message</b></p><style>.x{}</style>"
+        email = {"name": "ACT001", "text": html}
+        result = format_email(email, detail=True)
+        assert "Important" in result
+        assert "message" in result
+        assert "<p>" not in result
 
     def test_account_description_not_truncated(self):
         long_desc = "v" * 500
@@ -619,3 +764,205 @@ class TestFormatCallActivity:
         }
         result = format_call(record, base_url="https://example.daktela.com")
         assert "Ticket:" not in result
+
+
+class TestHtmlToMarkdown:
+    def test_simple_html(self):
+        result = _html_to_markdown("<p>Hello <b>world</b></p>")
+        assert "Hello" in result
+        assert "world" in result
+        assert "<p>" not in result
+
+    def test_relative_urls_prepended(self):
+        html = '<a href="/kb/article/123">Link</a>'
+        result = _html_to_markdown(html, base_url="https://example.daktela.com")
+        assert "https://example.daktela.com/kb/article/123" in result
+
+    def test_absolute_urls_unchanged(self):
+        html = '<a href="https://other.com/page">Link</a>'
+        result = _html_to_markdown(html, base_url="https://example.daktela.com")
+        assert "https://other.com/page" in result
+
+    def test_lists_converted(self):
+        html = "<ul><li>Item 1</li><li>Item 2</li></ul>"
+        result = _html_to_markdown(html)
+        assert "Item 1" in result
+        assert "Item 2" in result
+
+    def test_empty_input(self):
+        assert _html_to_markdown("") == ""
+        assert _html_to_markdown(None) == ""
+
+    def test_strips_style_blocks(self):
+        html = "<style>.foo { color: red; }</style><p>Content</p>"
+        result = _html_to_markdown(html)
+        assert "Content" in result
+        assert "color" not in result
+
+    def test_strips_script_blocks(self):
+        html = "<script>alert('x')</script><p>Safe</p>"
+        result = _html_to_markdown(html)
+        assert "Safe" in result
+        assert "alert" not in result
+
+    def test_collapses_whitespace(self):
+        html = "<p>First</p>\n\n\n\n<p>Second</p>"
+        result = _html_to_markdown(html)
+        assert "\n\n\n" not in result
+        assert "First" in result
+        assert "Second" in result
+
+
+class TestFormatArticle:
+    def test_list_mode(self):
+        record = {
+            "name": "article_001",
+            "title": "How to configure SIP trunk",
+            "folder": {"title": "Telephony", "name": "folder_tel"},
+            "tags": [{"title": "SIP"}, {"title": "VoIP"}],
+            "description": "Step by step guide for SIP trunk configuration",
+            "created": "2025-01-01",
+            "edited": "2025-06-15",
+        }
+        result = format_article(record)
+        assert "**article_001** - How to configure SIP trunk" in result
+        assert "Folder: Telephony" in result
+        assert "Tags: SIP, VoIP" in result
+        assert "Description:" in result
+        assert "Created: 2025-01-01" in result
+        # Should NOT have URL in list mode
+        assert "URL:" not in result
+
+    def test_detail_mode(self):
+        record = {
+            "name": "article_001",
+            "title": "SIP Guide",
+            "content": "<h1>Setup</h1><p>Follow these steps.</p>",
+            "seen_count": 42,
+            "created": "2025-01-01",
+        }
+        result = format_article(record, base_url="https://x.daktela.com", detail=True)
+        assert "URL: https://x.daktela.com/articles/update/article_001" in result
+        assert "Views: 42" in result
+        assert "Setup" in result
+        assert "Follow these steps" in result
+        assert "<h1>" not in result
+
+    def test_empty_fields(self):
+        record = {"name": "article_002", "title": "Empty"}
+        result = format_article(record)
+        assert "**article_002** - Empty" in result
+        assert "Folder:" not in result
+        assert "Tags:" not in result
+
+    def test_nested_folder_object(self):
+        record = {
+            "name": "a1",
+            "title": "Test",
+            "folder": {"title": "Docs", "name": "folder_docs"},
+        }
+        result = format_article(record)
+        assert "Folder: Docs" in result
+
+    def test_string_folder(self):
+        record = {"name": "a1", "title": "Test", "folder": "folder_123"}
+        result = format_article(record)
+        assert "Folder: folder_123" in result
+
+    def test_detail_without_content_shows_description(self):
+        record = {
+            "name": "a1",
+            "title": "Test",
+            "description": "Some description text",
+            "content": "",
+        }
+        result = format_article(record, detail=True)
+        assert "Description: Some description text" in result
+
+    def test_custom_fields(self):
+        record = {
+            "name": "a1",
+            "title": "Test",
+            "customFields": {"priority": "high"},
+        }
+        result = format_article(record)
+        assert "Priority: high" in result
+
+
+class TestFormatArticleList:
+    def test_empty(self):
+        assert format_article_list([], 0, 0, 10) == "No articles found."
+
+    def test_with_records(self):
+        records = [
+            {"name": "a1", "title": "First Article"},
+            {"name": "a2", "title": "Second Article"},
+        ]
+        result = format_article_list(records, 5, 0, 10)
+        assert "Showing 1-2 of 5 articles" in result
+        assert "**a1**" in result
+        assert "**a2**" in result
+
+    def test_pagination_hint(self):
+        records = [{"name": "a1", "title": "First"}]
+        result = format_article_list(records, 50, 0, 10)
+        assert "skip=1" in result
+
+    def test_no_pagination_on_last_page(self):
+        records = [{"name": "a1", "title": "First"}]
+        result = format_article_list(records, 1, 0, 10)
+        assert "skip=" not in result
+
+
+class TestFormatArticleFolderTree:
+    def test_empty(self):
+        assert format_article_folder_tree([]) == "No article folders found."
+
+    def test_flat_folders(self):
+        records = [
+            {"name": "folder_1", "title": "General", "parent": None, "article_count": 5},
+            {"name": "folder_2", "title": "Technical", "parent": None, "article_count": 3},
+        ]
+        result = format_article_folder_tree(records)
+        assert "folder_1" in result
+        assert "General" in result
+        assert "(5 articles)" in result
+        assert "folder_2" in result
+        assert "Technical" in result
+
+    def test_hierarchical_tree(self):
+        records = [
+            {"name": "folder_root", "title": "Root", "parent": None, "article_count": 0},
+            {"name": "folder_child", "title": "Child", "parent": {"name": "folder_root"}, "article_count": 2},
+        ]
+        result = format_article_folder_tree(records)
+        lines = result.split("\n")
+        # Root should not be indented, child should be
+        root_line = [l for l in lines if "folder_root" in l][0]
+        child_line = [l for l in lines if "folder_child" in l][0]
+        assert root_line.startswith("- ")
+        assert child_line.startswith("  - ")
+
+    def test_orphan_folders(self):
+        """Folders whose parent is not in the list should appear as roots."""
+        records = [
+            {"name": "folder_orphan", "title": "Orphan", "parent": {"name": "folder_missing"}, "article_count": 1},
+        ]
+        result = format_article_folder_tree(records)
+        assert "folder_orphan" in result
+        assert "Orphan" in result
+
+    def test_no_article_count(self):
+        records = [{"name": "folder_1", "title": "Empty"}]
+        result = format_article_folder_tree(records)
+        assert "folder_1" in result
+        assert "articles)" not in result
+
+    def test_total_count(self):
+        records = [
+            {"name": "f1", "title": "A"},
+            {"name": "f2", "title": "B"},
+            {"name": "f3", "title": "C"},
+        ]
+        result = format_article_folder_tree(records)
+        assert "3 total" in result
